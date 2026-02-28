@@ -1,44 +1,45 @@
 from flask import Flask, Response, request, jsonify
 from openai import OpenAI
 from dotenv import load_dotenv
+import asyncio
 import base64
-import subprocess
+import edge_tts
+import io
 import json
 import queue
-import glob
 import os
+import sys
 import threading
 import time
 import numpy as np
 import cv2
-import board
-import busio
-import adafruit_mlx90640
+
+if "--mock" not in sys.argv:
+    import board
+    import busio
+    import adafruit_mlx90640
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 app = Flask(__name__)
 
 SYNC_DIR = "/home/pi/souschef/data/sync"
-os.makedirs(SYNC_DIR, exist_ok=True)
+if "--mock" not in sys.argv:
+    os.makedirs(SYNC_DIR, exist_ok=True)
 
 ai = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
 
-# ---------- TTS (espeak-ng → bcm2835 PWM audio on GPIO 18) ----------
-_tts_proc = None
-_tts_lock = threading.Lock()
-
-def _speak(text):
-    """Speak text via espeak-ng, interrupting any ongoing speech."""
-    global _tts_proc
-    with _tts_lock:
-        if _tts_proc and _tts_proc.poll() is None:
-            _tts_proc.terminate()
-        _tts_proc = subprocess.Popen(
-            ["espeak-ng", "-s", "140", "-a", "200", text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+# ---------- TTS (edge-tts → MP3 served to browser) ----------
+def _tts_bytes(text, voice="en-US-AriaNeural", rate="+25%"):
+    """Generate MP3 bytes from text using edge-tts."""
+    async def _gen():
+        buf = io.BytesIO()
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+        return buf.getvalue()
+    return asyncio.run(_gen())
 
 
 # ---------- SSE broadcast (proactive alerts → all connected browsers) ----------
@@ -80,10 +81,19 @@ States (in order of typical progression):
 - DONE: Food appears fully cooked. Ready to plate.
 - OVERDONE: Food is overcooked — burning, charred, or smoking. Needs immediate attention.
 
-Format your response EXACTLY as:
+FEEDBACK rules — ONLY provide feedback when the cook is making a mistake:
+- Heat too high/low for what they're cooking (say "lower the heat" or "try medium heat", never cite degrees)
+- Food needs flipping/stirring and they haven't
+- Something is burning or about to burn
+- Pan is dry and food is sticking
+- Leave FEEDBACK blank when things are going fine. No praise, no encouragement, no "looking good".
+
+Never mention temperature numbers. Use terms like "too hot", "not hot enough", "medium heat", "low heat".
+
+Format EXACTLY as:
 STATE: <one of the states above>
-OBS: <your 1-2 sentence observation>
-FEEDBACK: <optional actionable advice, or leave blank>\
+OBS: <1 short sentence>
+FEEDBACK: <correction or leave blank>\
 """
 
 
@@ -196,13 +206,74 @@ def capture_loop():
         print("Camera released.")
 
 
+# ---------- Mock capture thread (reads from video file) ----------
+def mock_capture_loop(video_path):
+    global _rgb, _thermal, _composite, _t_min, _t_max, _t_avg
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"ERROR: could not open {video_path}")
+        return
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    delay = 1.0 / fps
+    start = time.time()
+
+    print(f"Mock capture running from {video_path} at {fps:.0f} fps")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap.read()
+            if not ret:
+                print("ERROR: could not read video frames")
+                return
+
+        elapsed = time.time() - start
+        # Simulate temp ramp: 25°C → 200°C over 2 minutes, then hold
+        base = 25 + min(elapsed / 120, 1.0) * 175
+        t_min = base - 15 + np.random.normal(0, 2)
+        t_max = base + 10 + np.random.normal(0, 2)
+        t_avg = (t_min + t_max) / 2
+
+        # Build fake thermal vis from frame brightness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(gray, (32, 24))
+        thermal_arr = (small.astype(np.float32) / 255.0) * (t_max - t_min) + t_min
+        denom = (t_max - t_min) if (t_max - t_min) > 1e-6 else 1.0
+        norm = ((thermal_arr - t_min) / denom * 255.0).astype(np.uint8)
+        vis = cv2.resize(norm, (480, 360), interpolation=cv2.INTER_NEAREST)
+        thermal_color = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
+        cv2.putText(thermal_color, f"min {t_min:.1f}C", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(thermal_color, f"max {t_max:.1f}C", (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        rgb_h, rgb_w = frame.shape[:2]
+        th_full = cv2.resize(thermal_color, (rgb_w, rgb_h), interpolation=cv2.INTER_NEAREST)
+        composite = cv2.addWeighted(frame, 0.6, th_full, 0.4, 0)
+        cv2.putText(composite, f"min {t_min:.1f}C  max {t_max:.1f}C", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        with _lock:
+            _rgb = frame.copy()
+            _thermal = thermal_color.copy()
+            _composite = composite.copy()
+            _t_min, _t_max, _t_avg = t_min, t_max, t_avg
+
+        time.sleep(delay)
+
+    cap.release()
+
+
 # ---------- Proactive observation loop ----------
 def proactive_loop():
     """Every 15 seconds, analyze the scene and broadcast structured feedback."""
     global _current_state
 
     while True:
-        time.sleep(15)
+        time.sleep(5)
 
         with _lock:
             frame   = _rgb.copy() if _rgb is not None else None
@@ -229,7 +300,7 @@ def proactive_loop():
         try:
             msg = ai.chat.completions.create(
                 model="anthropic/claude-opus-4.6",
-                max_tokens=150,
+                max_tokens=80,
                 messages=[
                     {
                         "role": "system",
@@ -270,11 +341,6 @@ def proactive_loop():
                 "observation": observation,
                 "feedback": feedback,
             })
-
-            spoken = observation
-            if feedback:
-                spoken += ". " + feedback
-            _speak(spoken)
         except Exception as e:
             print(f"Proactive check error: {e}")
 
@@ -307,7 +373,7 @@ def index():
           body { margin: 0; background: #111; color: #eee;
                  font-family: system-ui, -apple-system, sans-serif; }
           .wrap { display: grid; grid-template-columns: 1fr 1fr;
-                  gap: 12px; padding: 12px; height: calc(100vh - 40px); box-sizing: border-box; }
+                  gap: 12px; padding: 12px; height: calc(100vh - 120px); box-sizing: border-box; }
           .panel { background: #1a1a1a; border-radius: 12px; padding: 10px;
                    display: flex; flex-direction: column; }
           .title { font-size: 14px; opacity: 0.85; margin-bottom: 8px; }
@@ -333,7 +399,16 @@ def index():
         </div>
         <div class="bar">
           <a href="/composite">Composite view</a>
-          <a href="/voice">Voice assistant</a>
+        </div>
+
+        <!-- Voice assistant -->
+        <div class="voice-bar">
+          <button id="btn" title="Tap to ask">🎙️</button>
+          <div class="voice-text">
+            <div id="heard"></div>
+            <div id="answer"></div>
+            <div id="status">Tap the mic to ask a question</div>
+          </div>
         </div>
 
         <div id="feedback" class="fb">
@@ -345,6 +420,33 @@ def index():
         </div>
 
         <style>
+          .voice-bar {
+            position: fixed; bottom: 0; left: 0; right: 0;
+            background: rgba(20,20,20,0.96); border-top: 2px solid #333;
+            padding: 12px 20px; display: flex; align-items: center; gap: 16px;
+            z-index: 200;
+          }
+          #btn {
+            width: 56px; height: 56px; border-radius: 50%; border: none;
+            font-size: 24px; cursor: pointer; background: #2a2a2a;
+            flex-shrink: 0;
+            box-shadow: 0 0 0 0 rgba(200,60,60,0);
+            transition: background 0.2s, box-shadow 0.2s;
+          }
+          #btn.listening {
+            background: #b02020;
+            box-shadow: 0 0 0 8px rgba(200,60,60,0.25);
+            animation: pulse 1.2s ease-in-out infinite;
+          }
+          #btn.thinking { background: #2a4a2a; }
+          @keyframes pulse {
+            0%, 100% { box-shadow: 0 0 0 6px rgba(200,60,60,0.2); }
+            50%       { box-shadow: 0 0 0 14px rgba(200,60,60,0.05); }
+          }
+          .voice-text { flex: 1; min-width: 0; }
+          #heard  { font-size: 13px; color: #888; font-style: italic; min-height: 18px; }
+          #answer { font-size: 15px; line-height: 1.4; min-height: 20px; margin-top: 2px; }
+          #status { font-size: 12px; color: #555; margin-top: 2px; }
           .fb {
             position: fixed; bottom: -120px; left: 50%; transform: translateX(-50%);
             background: rgba(20,20,20,0.96); border-top: 3px solid #f59e0b;
@@ -352,7 +454,7 @@ def index():
             font-size: 15px; line-height: 1.5; z-index: 100;
             transition: bottom 0.4s ease; box-shadow: 0 -2px 24px rgba(0,0,0,0.5);
           }
-          .fb.show { bottom: 16px; }
+          .fb.show { bottom: 90px; }
           .fb-row { display: flex; align-items: flex-start; gap: 10px; }
           .fb-badge {
             flex-shrink: 0; background: #f59e0b; color: #111; font-size: 11px;
@@ -362,6 +464,94 @@ def index():
           .fb-tip { margin-top: 8px; color: #f59e0b; font-style: italic; }
         </style>
         <script>
+          // Voice assistant
+          const btn      = document.getElementById('btn');
+          const heardEl  = document.getElementById('heard');
+          const answerEl = document.getElementById('answer');
+          const statusEl = document.getElementById('status');
+
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (!SR) {
+            statusEl.textContent = 'Speech recognition not supported — try Chrome or Edge.';
+            btn.disabled = true;
+          }
+
+          btn.addEventListener('click', () => {
+            if (!SR || btn.disabled) return;
+            heardEl.textContent  = '';
+            answerEl.textContent = '';
+            const rec = new SR();
+            rec.lang = 'en-US';
+            rec.interimResults = false;
+            rec.maxAlternatives = 1;
+
+            btn.className = 'listening';
+            statusEl.textContent = 'Listening…';
+            rec.start();
+
+            rec.onresult = (e) => {
+              const q = e.results[0][0].transcript;
+              heardEl.textContent = '\u201c' + q + '\u201d';
+              askVoice(q);
+            };
+            rec.onerror = (e) => {
+              btn.className = '';
+              statusEl.textContent = 'Mic error: ' + e.error + '. Tap to retry.';
+            };
+            rec.onend = () => {
+              if (btn.className === 'listening') {
+                btn.className = 'thinking';
+                statusEl.textContent = 'Thinking…';
+              }
+            };
+          });
+
+          async function askVoice(question) {
+            btn.className = 'thinking';
+            statusEl.textContent = 'Thinking…';
+            try {
+              const res  = await fetch('/ask', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question })
+              });
+              const data = await res.json();
+              answerEl.textContent = data.answer;
+              btn.className = '';
+              statusEl.textContent = 'Tap the mic to ask another question';
+              speak(data.answer);
+            } catch (err) {
+              btn.className = '';
+              answerEl.textContent = 'Network error — is the server running?';
+              statusEl.textContent = 'Tap to retry';
+            }
+          }
+
+          let speaking = false;
+          const _audio = new Audio();
+          _audio.addEventListener('ended', () => { speaking = false; });
+          _audio.addEventListener('error', () => { speaking = false; });
+
+          async function speak(text) {
+            speaking = true;
+            try {
+              const res = await fetch('/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+              });
+              if (!res.ok) { speaking = false; return; }
+              const blob = await res.blob();
+              const url = URL.createObjectURL(blob);
+              _audio.src = url;
+              _audio.play();
+            } catch (e) {
+              console.error('TTS error:', e);
+              speaking = false;
+            }
+          }
+
+          // SSE for proactive observations
           const _es = new EventSource('/events');
           const _fb = document.getElementById('feedback');
           let _fbT;
@@ -375,6 +565,10 @@ def index():
             _fb.classList.add('show');
             clearTimeout(_fbT);
             _fbT = setTimeout(() => _fb.classList.remove('show'), 14000);
+            // Only speak if there's actionable feedback
+            if (d.feedback && btn.className === '' && !speaking) {
+              speak(d.feedback);
+            }
           };
         </script>
       </body>
@@ -499,6 +693,20 @@ def events():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.route("/tts", methods=["POST"])
+def tts():
+    """Generate MP3 audio from text using edge-tts."""
+    text = (request.get_json() or {}).get("text", "").strip()
+    if not text:
+        return "No text provided", 400
+    try:
+        audio = _tts_bytes(text)
+        return Response(audio, mimetype="audio/mpeg")
+    except Exception as e:
+        print(f"TTS error: {e}")
+        return "TTS generation failed", 500
+
+
 @app.route("/ask", methods=["POST"])
 def ask():
     """Receive a question, send current frame + thermal data to Claude, return answer."""
@@ -524,15 +732,13 @@ def ask():
     try:
         msg = ai.chat.completions.create(
             model="anthropic/claude-opus-4.6",
-            max_tokens=200,
+            max_tokens=80,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are SousChef, a warm and knowledgeable cooking assistant "
-                        "watching through a kitchen camera. You also have a thermal sensor. "
-                        "Give brief, practical, conversational answers — 1 to 3 sentences. "
-                        "Speak like a helpful chef standing next to the cook."
+                        "You are SousChef, a cooking assistant with a kitchen camera and thermal sensor. "
+                        "Answer in 1 sentence — 2 max if essential. Be direct, like a chef calling out instructions."
                     )
                 },
                 {
@@ -622,11 +828,34 @@ def voice_page():
             btn.disabled = true;
           }
 
+          let speaking = false;
+          const _audio = new Audio();
+          _audio.addEventListener('ended', () => { speaking = false; });
+          _audio.addEventListener('error', () => { speaking = false; });
+
+          async function speak(text) {
+            speaking = true;
+            try {
+              const res = await fetch('/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+              });
+              if (!res.ok) { speaking = false; return; }
+              const blob = await res.blob();
+              const url = URL.createObjectURL(blob);
+              _audio.src = url;
+              _audio.play();
+            } catch (e) {
+              console.error('TTS error:', e);
+              speaking = false;
+            }
+          }
+
           btn.addEventListener('click', () => {
             if (!SR || btn.disabled) return;
             heardEl.textContent  = '';
             answerEl.textContent = '';
-            window.speechSynthesis.cancel();
 
             const rec = new SR();
             rec.lang = 'en-US';
@@ -677,24 +906,18 @@ def voice_page():
             }
           }
 
-          function speak(text) {
-            window.speechSynthesis.cancel();
-            const u = new SpeechSynthesisUtterance(text);
-            u.rate = 0.92;
-            window.speechSynthesis.speak(u);
-          }
-
           // Proactive observations via SSE
           const es = new EventSource('/events');
           es.onmessage = (e) => {
             const d = JSON.parse(e.data);
-            // Don't interrupt if user is mid-question
-            if (btn.className !== '') return;
+            // Don't interrupt if user is mid-question or already speaking
+            if (btn.className !== '' || speaking) return;
             let text = d.observation || '';
             if (d.feedback) text += ' ' + d.feedback;
             answerEl.textContent = text;
             heardEl.textContent = d.state ? '[' + d.state + ']' : '';
-            speak(text);
+            // Only speak if there's actionable feedback
+            if (d.feedback) speak(d.feedback);
           };
           es.onerror = () => { /* reconnects automatically */ };
         </script>
@@ -705,6 +928,14 @@ def voice_page():
 
 # ---------- Start ----------
 if __name__ == "__main__":
-    threading.Thread(target=capture_loop,   daemon=True).start()
+    if "--mock" in sys.argv:
+        video = os.path.join(os.path.dirname(__file__), "..", "data", "test.mp4")
+        for i, arg in enumerate(sys.argv):
+            if arg == "--video" and i + 1 < len(sys.argv):
+                video = sys.argv[i + 1]
+        threading.Thread(target=mock_capture_loop, args=(video,), daemon=True).start()
+    else:
+        threading.Thread(target=capture_loop, daemon=True).start()
+
     threading.Thread(target=proactive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8000, threaded=True)
