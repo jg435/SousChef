@@ -60,7 +60,7 @@ if LLM_ENABLED:
             img_b64 = base64.b64encode(jpg.tobytes()).decode("utf-8")
             try:
                 response = llm.chat.completions.create(
-                    model="google/gemini-2.5-flash-preview",
+                    model="google/gemini-2.5-flash",
                     messages=[{
                         "role": "user",
                         "content": [
