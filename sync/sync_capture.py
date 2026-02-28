@@ -1,14 +1,22 @@
 import time
 import os
+import sys
+import base64
+import threading
 import numpy as np
 import cv2
 import board
 import busio
 import adafruit_mlx90640
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ---------- Settings ----------
 SAVE_DIR = "/home/pi/souschef/data/sync"
 CAPTURE_INTERVAL = 0.25  # seconds (4 fps, matches thermal camera)
+LLM_ENABLED = "LLM=true" in sys.argv
+LLM_INTERVAL = 30  # seconds between LLM calls
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -27,6 +35,52 @@ cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
 if not cap.isOpened():
     raise RuntimeError("Could not open RGB camera at /dev/video0")
+
+# ---------- LLM setup ----------
+_last_frame = None
+_frame_lock = threading.Lock()
+
+if LLM_ENABLED:
+    from openai import OpenAI
+    llm = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
+
+    def llm_loop():
+        while True:
+            time.sleep(LLM_INTERVAL)
+            with _frame_lock:
+                frame = _last_frame.copy() if _last_frame is not None else None
+            if frame is None:
+                continue
+            ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                continue
+            img_b64 = base64.b64encode(jpg.tobytes()).decode("utf-8")
+            try:
+                response = llm.chat.completions.create(
+                    model="google/gemini-2.5-flash-preview",
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                            },
+                            {
+                                "type": "text",
+                                "text": "Describe what you see in this kitchen camera image. Be concise and specific."
+                            }
+                        ]
+                    }]
+                )
+                print(f"\n[LLM {time.strftime('%H:%M:%S')}] {response.choices[0].message.content}\n")
+            except Exception as e:
+                print(f"LLM error: {e}")
+
+    threading.Thread(target=llm_loop, daemon=True).start()
+    print("LLM descriptions enabled (every 30s).")
 
 print("Starting synchronized capture at 4 fps. Press Ctrl+C to stop.")
 print(f"Saving to: {SAVE_DIR}")
@@ -70,6 +124,9 @@ try:
         if ret:
             rgb_path = os.path.join(SAVE_DIR, f"rgb_{timestamp}.jpg")
             cv2.imwrite(rgb_path, frame)
+            if LLM_ENABLED:
+                with _frame_lock:
+                    _last_frame = frame.copy()
         else:
             print("RGB frame capture failed")
 
