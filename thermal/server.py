@@ -39,6 +39,67 @@ _t_min   = 0.0
 _t_max   = 0.0
 _t_avg   = 0.0
 
+# ---------- State tracking (structured proactive analysis) ----------
+_current_state = None
+_state_log     = []
+
+VALID_STATES = ("NO_STOVE", "IDLE", "PREHEATING", "READY", "COOKING", "DONE", "OVERDONE")
+
+PROACTIVE_SYSTEM = """\
+You are SousChef, a kitchen assistant watching through a camera above a stovetop.
+
+Determine the current cooking state and share a brief observation.
+
+States (in order of typical progression):
+- NO_STOVE: Image does NOT show a stove or cooktop.
+- IDLE: Stove visible but off. No active heat, no food.
+- PREHEATING: Burner on, pan/pot warming up, not hot enough to cook yet.
+- READY: Pan/pot is hot and ready for food.
+- COOKING: Food is actively being cooked.
+- DONE: Food appears fully cooked. Ready to plate.
+- OVERDONE: Food is overcooked — burning, charred, or smoking. Needs immediate attention.
+
+Format your response EXACTLY as:
+STATE: <one of the states above>
+OBS: <your 1-2 sentence observation>
+FEEDBACK: <optional actionable advice, or leave blank>\
+"""
+
+
+def parse_state_response(raw):
+    """Parse structured LLM response into (state, observation, feedback)."""
+    state = None
+    observation = ""
+    feedback = None
+    for line in raw.strip().splitlines():
+        if line.startswith("STATE:"):
+            val = line.split(":", 1)[1].strip().upper()
+            if val in VALID_STATES:
+                state = val
+        elif line.startswith("OBS:"):
+            observation = line.split(":", 1)[1].strip()
+        elif line.startswith("FEEDBACK:"):
+            val = line.split(":", 1)[1].strip()
+            if val:
+                feedback = val
+    if not observation:
+        observation = raw.strip()
+    return state, observation, feedback
+
+
+def state_history_text(log):
+    """Format recent state transitions for LLM context."""
+    if not log:
+        return ""
+    lines = ["Recent state history:"]
+    for entry in log[-5:]:
+        line = f"- {entry['state']}: {entry['observation']}"
+        if entry.get("feedback"):
+            line += f" (feedback: {entry['feedback']})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 # ---------- Capture thread ----------
 def capture_loop():
     global _rgb, _thermal, _composite, _t_min, _t_max, _t_avg
@@ -114,60 +175,39 @@ def capture_loop():
 
 # ---------- Proactive observation loop ----------
 def proactive_loop():
-    """Periodically ask Claude if anything interesting is happening and broadcast it."""
-    CHECK_INTERVAL   = 5    # seconds between thermal checks
-    MIN_CALL_GAP     = 30   # minimum seconds between Claude calls
-    HOT_THRESHOLD    = 45.0 # °C — only bother calling Claude if something is warm
-    TEMP_DELTA_TRIGGER = 12.0  # °C change since last call also triggers early
-
-    last_call_time = 0.0
-    last_t_max     = 0.0
+    """Every 15 seconds, analyze the scene and broadcast structured feedback."""
+    global _current_state
 
     while True:
-        time.sleep(CHECK_INTERVAL)
+        time.sleep(15)
 
         with _lock:
             frame   = _rgb.copy() if _rgb is not None else None
-            t_max_v = _t_max
             t_min_v = _t_min
+            t_max_v = _t_max
             t_avg_v = _t_avg
 
         if frame is None:
             continue
-
-        now = time.time()
-        time_since_last = now - last_call_time
-        temp_jumped     = abs(t_max_v - last_t_max) >= TEMP_DELTA_TRIGGER
-
-        should_call = (
-            t_max_v >= HOT_THRESHOLD and time_since_last >= MIN_CALL_GAP
-        ) or (
-            temp_jumped and time_since_last >= 15
-        )
-
-        if not should_call:
-            continue
-
-        last_call_time = now
-        last_t_max     = t_max_v
 
         ok, jpg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if not ok:
             continue
         img_b64 = base64.b64encode(jpg.tobytes()).decode("utf-8")
 
+        text_parts = [
+            f"Thermal sensor — min: {t_min_v:.1f}°C, max: {t_max_v:.1f}°C, avg: {t_avg_v:.1f}°C."
+        ]
+        sh = state_history_text(_state_log)
+        if sh:
+            text_parts.append(sh)
+        text_parts.append("What do you observe?")
+
         try:
             msg = ai.messages.create(
                 model="claude-opus-4-6",
-                max_tokens=100,
-                system=(
-                    "You are SousChef, a kitchen assistant watching through a camera. "
-                    "If you see food being cooked or actively prepared, share one brief, "
-                    "useful observation — a tip, a warning, or what you notice. "
-                    "1-2 sentences max. Speak directly to the cook. "
-                    "If nothing is cooking or the scene is empty/uninteresting, "
-                    "reply with only the single word: nothing"
-                ),
+                max_tokens=150,
+                system=PROACTIVE_SYSTEM,
                 messages=[{
                     "role": "user",
                     "content": [
@@ -181,19 +221,31 @@ def proactive_loop():
                         },
                         {
                             "type": "text",
-                            "text": (
-                                f"Thermal — min: {t_min_v:.1f}°C, "
-                                f"max: {t_max_v:.1f}°C, avg: {t_avg_v:.1f}°C. "
-                                "What do you observe?"
-                            )
+                            "text": "\n".join(text_parts)
                         }
                     ]
                 }]
             )
-            observation = msg.content[0].text.strip()
-            if observation.lower() != "nothing":
-                print(f"[proactive] {observation}")
-                _broadcast(observation)
+            raw = msg.content[0].text.strip()
+            state, observation, feedback = parse_state_response(raw)
+
+            if state:
+                _current_state = state
+                _state_log.append({
+                    "state": state,
+                    "observation": observation,
+                    "feedback": feedback,
+                })
+
+            print(f"[proactive] [{state or '?'}] {observation}")
+            if feedback:
+                print(f"[proactive]  -> {feedback}")
+
+            _broadcast({
+                "state": state,
+                "observation": observation,
+                "feedback": feedback,
+            })
         except Exception as e:
             print(f"Proactive check error: {e}")
 
@@ -254,6 +306,48 @@ def index():
           <a href="/composite">Composite view</a>
           <a href="/voice">Voice assistant</a>
         </div>
+
+        <div id="feedback" class="fb">
+          <div class="fb-row">
+            <span id="fb-state" class="fb-badge"></span>
+            <span id="fb-obs"></span>
+          </div>
+          <div id="fb-tip" class="fb-tip"></div>
+        </div>
+
+        <style>
+          .fb {
+            position: fixed; bottom: -120px; left: 50%; transform: translateX(-50%);
+            background: rgba(20,20,20,0.96); border-top: 3px solid #f59e0b;
+            border-radius: 12px; padding: 14px 22px; max-width: 620px; width: 90%;
+            font-size: 15px; line-height: 1.5; z-index: 100;
+            transition: bottom 0.4s ease; box-shadow: 0 -2px 24px rgba(0,0,0,0.5);
+          }
+          .fb.show { bottom: 16px; }
+          .fb-row { display: flex; align-items: flex-start; gap: 10px; }
+          .fb-badge {
+            flex-shrink: 0; background: #f59e0b; color: #111; font-size: 11px;
+            font-weight: 700; padding: 3px 8px; border-radius: 4px;
+            letter-spacing: 0.05em; margin-top: 2px;
+          }
+          .fb-tip { margin-top: 8px; color: #f59e0b; font-style: italic; }
+        </style>
+        <script>
+          const _es = new EventSource('/events');
+          const _fb = document.getElementById('feedback');
+          let _fbT;
+          _es.onmessage = (e) => {
+            const d = JSON.parse(e.data);
+            document.getElementById('fb-state').textContent = d.state || '';
+            document.getElementById('fb-obs').textContent = d.observation || '';
+            const tip = document.getElementById('fb-tip');
+            tip.textContent = d.feedback || '';
+            tip.style.display = d.feedback ? 'block' : 'none';
+            _fb.classList.add('show');
+            clearTimeout(_fbT);
+            _fbT = setTimeout(() => _fb.classList.remove('show'), 14000);
+          };
+        </script>
       </body>
     </html>
     """
@@ -300,12 +394,53 @@ def composite_page():
       <body>
         <img id="c" src="/latest">
         <p id="ts">Loading...</p>
+        <div id="feedback" class="fb">
+          <div class="fb-row">
+            <span id="fb-state" class="fb-badge"></span>
+            <span id="fb-obs"></span>
+          </div>
+          <div id="fb-tip" class="fb-tip"></div>
+        </div>
+
+        <style>
+          .fb {
+            position: fixed; bottom: -120px; left: 50%; transform: translateX(-50%);
+            background: rgba(20,20,20,0.96); border-top: 3px solid #f59e0b;
+            border-radius: 12px; padding: 14px 22px; max-width: 620px; width: 90%;
+            font-size: 15px; line-height: 1.5; color: #eee; font-family: system-ui, sans-serif;
+            z-index: 100; transition: bottom 0.4s ease;
+            box-shadow: 0 -2px 24px rgba(0,0,0,0.5);
+          }
+          .fb.show { bottom: 16px; }
+          .fb-row { display: flex; align-items: flex-start; gap: 10px; }
+          .fb-badge {
+            flex-shrink: 0; background: #f59e0b; color: #111; font-size: 11px;
+            font-weight: 700; padding: 3px 8px; border-radius: 4px;
+            letter-spacing: 0.05em; margin-top: 2px;
+          }
+          .fb-tip { margin-top: 8px; color: #f59e0b; font-style: italic; }
+        </style>
         <script>
           setInterval(() => {
             document.getElementById('c').src = '/latest?t=' + Date.now();
             document.getElementById('ts').textContent =
               'Last updated: ' + new Date().toLocaleTimeString();
           }, 500);
+
+          const _es = new EventSource('/events');
+          const _fb = document.getElementById('feedback');
+          let _fbT;
+          _es.onmessage = (e) => {
+            const d = JSON.parse(e.data);
+            document.getElementById('fb-state').textContent = d.state || '';
+            document.getElementById('fb-obs').textContent = d.observation || '';
+            const tip = document.getElementById('fb-tip');
+            tip.textContent = d.feedback || '';
+            tip.style.display = d.feedback ? 'block' : 'none';
+            _fb.classList.add('show');
+            clearTimeout(_fbT);
+            _fbT = setTimeout(() => _fb.classList.remove('show'), 14000);
+          };
         </script>
       </body>
     </html>
@@ -322,8 +457,8 @@ def events():
         try:
             while True:
                 try:
-                    text = q.get(timeout=20)
-                    yield f"data: {json.dumps({'text': text})}\n\n"
+                    data = q.get(timeout=20)
+                    yield f"data: {json.dumps(data)}\n\n"
                 except queue.Empty:
                     yield ": keepalive\n\n"
         finally:
@@ -522,12 +657,14 @@ def voice_page():
           // Proactive observations via SSE
           const es = new EventSource('/events');
           es.onmessage = (e) => {
-            const data = JSON.parse(e.data);
+            const d = JSON.parse(e.data);
             // Don't interrupt if user is mid-question
             if (btn.className !== '') return;
-            answerEl.textContent = data.text;
-            heardEl.textContent  = '';
-            speak(data.text);
+            let text = d.observation || '';
+            if (d.feedback) text += ' ' + d.feedback;
+            answerEl.textContent = text;
+            heardEl.textContent = d.state ? '[' + d.state + ']' : '';
+            speak(text);
           };
           es.onerror = () => { /* reconnects automatically */ };
         </script>

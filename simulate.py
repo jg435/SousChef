@@ -45,11 +45,13 @@ States (in order of typical progression):
 
 Format your response EXACTLY as:
 STATE: <one of the states above>
-<your 1-2 sentence observation>
+OBS: <your 1-2 sentence observation of what you see>
+FEEDBACK: <optional — actionable advice for the cook if something needs attention, or leave blank>
 
 Example:
 STATE: COOKING
-The egg whites are starting to set around the edges — don't touch it yet.\
+OBS: Eggs are in the pan, whites are just starting to set around the edges.
+FEEDBACK: Don't touch them yet — let the whites firm up before flipping.\
 """
 
 REACTIVE_SYSTEM = (
@@ -97,16 +99,35 @@ def build_history_messages(history: list[dict]) -> list[dict]:
     return history[-HISTORY_LIMIT:]
 
 
-def parse_state_response(raw: str) -> tuple[str | None, str]:
-    """Parse a 'STATE: ...\nobservation' response into (state, observation)."""
-    lines = raw.strip().splitlines()
-    if lines and lines[0].startswith("STATE:"):
-        state = lines[0].split(":", 1)[1].strip().upper()
-        observation = "\n".join(lines[1:]).strip()
-        if state not in VALID_STATES:
-            state = None
-        return state, observation
-    return None, raw.strip()
+def parse_state_response(raw: str) -> tuple[str | None, str, str | None]:
+    """Parse a structured response into (state, observation, feedback).
+
+    Expected format:
+        STATE: COOKING
+        OBS: Eggs are in the pan...
+        FEEDBACK: Don't touch them yet...
+    """
+    state = None
+    observation = ""
+    feedback = None
+
+    for line in raw.strip().splitlines():
+        if line.startswith("STATE:"):
+            val = line.split(":", 1)[1].strip().upper()
+            if val in VALID_STATES:
+                state = val
+        elif line.startswith("OBS:"):
+            observation = line.split(":", 1)[1].strip()
+        elif line.startswith("FEEDBACK:"):
+            val = line.split(":", 1)[1].strip()
+            if val:
+                feedback = val
+
+    # Fallback: if parsing failed, treat the whole response as observation
+    if not observation:
+        observation = raw.strip()
+
+    return state, observation, feedback
 
 
 def state_history_text(state_log: list[dict]) -> str:
@@ -115,14 +136,17 @@ def state_history_text(state_log: list[dict]) -> str:
         return ""
     lines = ["State history:"]
     for entry in state_log[-5:]:
-        lines.append(f"- {entry['state']}: {entry['observation']}")
+        line = f"- {entry['state']}: {entry['observation']}"
+        if entry.get("feedback"):
+            line += f" (feedback given: {entry['feedback']})"
+        lines.append(line)
     return "\n".join(lines)
 
 
 def call_proactive(client: OpenAI, img_b64: str, mime: str,
                    thermal: dict | None, history: list[dict],
-                   state_log: list[dict]) -> tuple[str | None, str]:
-    """Proactive call: auto-analyze a scene. Returns (state, observation)."""
+                   state_log: list[dict]) -> tuple[str | None, str, str | None]:
+    """Proactive call: auto-analyze a scene. Returns (state, observation, feedback)."""
     user_content = [make_image_content(img_b64, mime)]
 
     text_parts = []
@@ -251,15 +275,18 @@ def main():
 
             # Proactive analysis
             try:
-                state, observation = call_proactive(
+                state, observation, feedback = call_proactive(
                     client, img_b64, mime, thermal, history, state_log,
                 )
+                print("state_log: " + str(state_log))
                 if state:
                     current_state = state
-                    state_log.append({"state": state, "observation": observation})
+                    state_log.append({"state": state, "observation": observation, "feedback": feedback})
                     print(f"[{state}] {observation}")
                 else:
                     print(observation)
+                if feedback:
+                    print(feedback)
                 history.append({"role": "user", "content": f"[loaded image: {path}]"})
                 history.append({"role": "assistant", "content": observation})
             except Exception as e:
@@ -287,15 +314,18 @@ def main():
             if current_image:
                 img_b64, mime = current_image
                 try:
-                    state, observation = call_proactive(
+                    state, observation, feedback = call_proactive(
                         client, img_b64, mime, thermal, history, state_log,
                     )
+                    print("state_log: " + str(state_log))
                     if state:
                         current_state = state
-                        state_log.append({"state": state, "observation": observation})
+                        state_log.append({"state": state, "observation": observation, "feedback": feedback})
                         print(f"[{state}] {observation}")
                     else:
                         print(observation)
+                    if feedback:
+                        print(feedback)
                     history.append({
                         "role": "user",
                         "content": f"[thermal update: min={t_min}, max={t_max}, avg={t_avg}]",
