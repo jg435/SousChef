@@ -19,6 +19,10 @@ if "--mock" not in sys.argv:
     import busio
     import adafruit_mlx90640
 
+import sys
+sys.path.insert(0, "/home/pi/souschef")
+import led_states
+
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 app = Flask(__name__)
@@ -331,6 +335,7 @@ def proactive_loop():
                     "observation": observation,
                     "feedback": feedback,
                 })
+                led_states.set_led_state(state)
 
             print(f"[proactive] [{state or '?'}] {observation}")
             if feedback:
