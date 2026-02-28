@@ -1,6 +1,8 @@
 from flask import Flask, Response, request, jsonify
-import anthropic
+from openai import OpenAI
+from dotenv import load_dotenv
 import base64
+import subprocess
 import json
 import queue
 import glob
@@ -13,12 +15,31 @@ import board
 import busio
 import adafruit_mlx90640
 
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
 app = Flask(__name__)
 
 SYNC_DIR = "/home/pi/souschef/data/sync"
 os.makedirs(SYNC_DIR, exist_ok=True)
 
-ai = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+ai = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
+
+# ---------- TTS (espeak-ng → bcm2835 PWM audio on GPIO 18) ----------
+_tts_proc = None
+_tts_lock = threading.Lock()
+
+def _speak(text):
+    """Speak text via espeak-ng, interrupting any ongoing speech."""
+    global _tts_proc
+    with _tts_lock:
+        if _tts_proc and _tts_proc.poll() is None:
+            _tts_proc.terminate()
+        _tts_proc = subprocess.Popen(
+            ["espeak-ng", "-s", "140", "-a", "200", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
 
 # ---------- SSE broadcast (proactive alerts → all connected browsers) ----------
 _sse_listeners      = []
@@ -139,6 +160,8 @@ def capture_loop():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 cv2.putText(thermal_color, f"max {t_max:.1f}C", (10, 55),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            except ValueError:
+                continue  # MLX90640 occasionally returns a corrupt frame; skip silently
             except Exception as e:
                 print(f"Thermal error: {e}")
                 continue
@@ -204,29 +227,30 @@ def proactive_loop():
         text_parts.append("What do you observe?")
 
         try:
-            msg = ai.messages.create(
-                model="claude-opus-4-6",
+            msg = ai.chat.completions.create(
+                model="anthropic/claude-opus-4.6",
                 max_tokens=150,
-                system=PROACTIVE_SYSTEM,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": img_b64
+                messages=[
+                    {
+                        "role": "system",
+                        "content": PROACTIVE_SYSTEM
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                            },
+                            {
+                                "type": "text",
+                                "text": "\n".join(text_parts)
                             }
-                        },
-                        {
-                            "type": "text",
-                            "text": "\n".join(text_parts)
-                        }
-                    ]
-                }]
+                        ]
+                    }
+                ]
             )
-            raw = msg.content[0].text.strip()
+            raw = msg.choices[0].message.content.strip()
             state, observation, feedback = parse_state_response(raw)
 
             if state:
@@ -246,6 +270,11 @@ def proactive_loop():
                 "observation": observation,
                 "feedback": feedback,
             })
+
+            spoken = observation
+            if feedback:
+                spoken += ". " + feedback
+            _speak(spoken)
         except Exception as e:
             print(f"Proactive check error: {e}")
 
@@ -493,38 +522,39 @@ def ask():
     img_b64 = base64.b64encode(jpg.tobytes()).decode("utf-8")
 
     try:
-        msg = ai.messages.create(
-            model="claude-opus-4-6",
+        msg = ai.chat.completions.create(
+            model="anthropic/claude-opus-4.6",
             max_tokens=200,
-            system=(
-                "You are SousChef, a warm and knowledgeable cooking assistant "
-                "watching through a kitchen camera. You also have a thermal sensor. "
-                "Give brief, practical, conversational answers — 1 to 3 sentences. "
-                "Speak like a helpful chef standing next to the cook."
-            ),
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": img_b64
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are SousChef, a warm and knowledgeable cooking assistant "
+                        "watching through a kitchen camera. You also have a thermal sensor. "
+                        "Give brief, practical, conversational answers — 1 to 3 sentences. "
+                        "Speak like a helpful chef standing next to the cook."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Thermal sensor — min: {t_min_v:.1f}°C, "
+                                f"max: {t_max_v:.1f}°C, avg: {t_avg_v:.1f}°C.\n"
+                                f"Question: {question}"
+                            )
                         }
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"Thermal sensor — min: {t_min_v:.1f}°C, "
-                            f"max: {t_max_v:.1f}°C, avg: {t_avg_v:.1f}°C.\n"
-                            f"Question: {question}"
-                        )
-                    }
-                ]
-            }]
+                    ]
+                }
+            ]
         )
-        answer = msg.content[0].text
+        answer = msg.choices[0].message.content
     except Exception as e:
         print(f"Claude API error: {e}")
         answer = "Sorry, I had trouble thinking that through. Try again?"
