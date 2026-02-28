@@ -1,72 +1,136 @@
 """
-Speaker test for CQRobot 3W 4Ohm on GPIO 18 (Pi 4 bcm2835 PWM audio).
+Speaker test for CQRobot 3W 4Ohm on GPIO 18, Raspberry Pi 4B.
 
-GPIO 18 is the bcm2835 PWM0 output — driven by dtparam=audio=on.
-Audio card: 'bcm2835 Headphones' (card 0, mono).
+Findings:
+  - audremap overlay does NOT route snd_bcm2835 audio to GPIO 18 on BCM2711 (Pi 4).
+    It only works on BCM2835 (Pi 3/Zero). GPIO 18 stays 'input' during ALSA playback.
+  - Raw PWM on GPIO 18 via sysfs DOES work (pwmchip0/pwm0 → Alt5 → PWM0_0).
+  - snd_bcm2835 audio goes to GPIO 40/41 (3.5mm jack circuit). Plug into that jack
+    to confirm audio software works, then use a PAM8403 amplifier board on GPIO 18
+    for full speaker output.
+
+Tests in this file:
+  1. ALSA / espeak-ng → 3.5mm jack  (confirms audio pipeline works)
+  2. Raw PWM tone on GPIO 18         (confirms pin is physically connected)
 """
+import os
 import subprocess
 import sys
 import time
 
+ESPEAK_SPEED = 140
+ESPEAK_AMP   = 200
+PWM_CHIP     = "/sys/class/pwm/pwmchip0"
+PWM_DEV      = PWM_CHIP + "/pwm0"
 
-ESPEAK_SPEED = 140   # words per minute (try 120-160)
-ESPEAK_AMP   = 200   # amplitude 0-200
 
+# ── helpers ──────────────────────────────────────────────────────────────────
 
 def run(cmd, check=True):
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if check and result.returncode != 0:
-        print(f"ERROR running {' '.join(cmd)}:\n{result.stderr.strip()}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        print(f"  ERROR: {' '.join(cmd)}\n  {r.stderr.strip()}")
         sys.exit(1)
-    return result
+    return r
+
+def gpio_state(pin):
+    r = subprocess.run(["pinctrl", "get", str(pin)], capture_output=True, text=True)
+    return r.stdout.strip()
+
+def pwm_write(path, value):
+    with open(path, "w") as f:
+        f.write(str(value))
 
 
-def show_audio_info():
-    print("=== ALSA devices ===")
-    r = run(["aplay", "-l"], check=False)
-    for line in r.stdout.splitlines():
-        if "bcm2835" in line or "card" in line.lower():
-            print(" ", line)
+# ── Test 1: ALSA / espeak → 3.5mm jack ───────────────────────────────────────
 
-    print("\n=== PCM volume ===")
-    r = run(["amixer", "-M", "sget", "PCM"], check=False)
-    for line in r.stdout.splitlines():
-        if any(k in line for k in ("Mono", "Front", "dB", "%")):
-            print(" ", line.strip())
+print("=" * 60)
+print("TEST 1: ALSA audio via 3.5mm jack (snd_bcm2835, GPIO 40/41)")
+print("  Connect headphones or a speaker to the 3.5mm jack to verify.")
+print("=" * 60)
+
+# Set volume to 100%
+run(["amixer", "-q", "-M", "sset", "PCM", "100%"])
+r = run(["amixer", "-M", "sget", "PCM"], check=False)
+for line in r.stdout.splitlines():
+    if "%" in line:
+        print(f"  Volume: {line.strip()}")
+
+print("  Playing 440 Hz tone for 1 second via ALSA...")
+run(["speaker-test", "-t", "sin", "-f", "440", "-c", "1", "-l", "1",
+     "-s", "1"], check=False)
+
+print("  Speaking via espeak-ng → sox +20dB → aplay hw:0,0 ...")
+import shlex
+espeak = subprocess.Popen(
+    ["espeak-ng", "--stdout", "-s", str(ESPEAK_SPEED),
+     "SousChef audio test. If you hear this, the pipeline is working."],
+    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+)
+sox = subprocess.Popen(
+    ["sox", "-t", "wav", "-", "-t", "wav", "-", "gain", "20"],
+    stdin=espeak.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+)
+espeak.stdout.close()
+aplay = subprocess.Popen(
+    ["aplay", "-D", "hw:0,0", "-"],
+    stdin=sox.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+sox.stdout.close()
+aplay.wait()
+
+print()
 
 
-def set_volume(pct):
-    print(f"\n>>> Setting PCM volume to {pct}%")
-    run(["amixer", "-q", "-M", "sset", "PCM", f"{pct}%"])
+# ── Test 2: Raw PWM tone on GPIO 18 ──────────────────────────────────────────
+
+print("=" * 60)
+print("TEST 2: Raw PWM tone on GPIO 18 (1 kHz, 50% duty cycle)")
+print("  You should hear a faint 1 kHz buzz if the speaker is wired.")
+print("  NOTE: GPIO 18 sources max ~16 mA. A 4-ohm speaker needs an")
+print("  amplifier (e.g. PAM8403) for audible output.")
+print("=" * 60)
+
+if not os.path.exists(PWM_CHIP):
+    print("  FAIL: pwmchip0 not found. PWM overlay not loaded.")
+    sys.exit(1)
+
+# Export PWM0
+if not os.path.exists(PWM_DEV):
+    try:
+        pwm_write(PWM_CHIP + "/export", 0)
+        time.sleep(0.2)
+    except PermissionError:
+        print("  FAIL: cannot export pwm0 (run with sudo?)")
+        sys.exit(1)
+
+print(f"  GPIO 18 before enable: {gpio_state(18)}")
+
+# 1 kHz tone: period = 1,000,000 ns, 50% duty
+pwm_write(PWM_DEV + "/duty_cycle", 0)
+pwm_write(PWM_DEV + "/period", 1_000_000)
+pwm_write(PWM_DEV + "/duty_cycle", 500_000)
+pwm_write(PWM_DEV + "/enable", 1)
+
+print(f"  GPIO 18 after  enable: {gpio_state(18)}")
+print("  Buzzing for 2 seconds...")
+time.sleep(2)
+
+pwm_write(PWM_DEV + "/enable", 0)
+pwm_write(PWM_DEV + "/duty_cycle", 0)
+pwm_write(PWM_CHIP + "/unexport", 0)
+
+print(f"  GPIO 18 after cleanup: {gpio_state(18)}")
+print()
 
 
-def speak(text):
-    print(f"    Speaking: \"{text}\"")
-    result = subprocess.run(
-        ["espeak-ng", "-s", str(ESPEAK_SPEED), "-a", str(ESPEAK_AMP), text],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"    espeak-ng error: {result.stderr.strip()}")
-    time.sleep(0.5)
+# ── Summary ───────────────────────────────────────────────────────────────────
 
-
-# ── Run tests ────────────────────────────────────────────────────────────────
-
-show_audio_info()
-
-print("\n=== Test 1: volume at 75% ===")
-set_volume(75)
-speak("SousChef speaker test at 75 percent.")
-
-print("\n=== Test 2: volume at 100% ===")
-set_volume(100)
-speak("SousChef speaker test at 100 percent.")
-
-print("\n=== Test 3: kitchen phrase ===")
-speak("Your pan is hot and ready for oil.")
-
-print("\n=== Test 4: warning phrase ===")
-speak("Warning — the onions are starting to burn.")
-
-print("\nDone. Leaving volume at 100%.")
+print("=" * 60)
+print("SUMMARY")
+print("  audremap does not work on Pi 4 (BCM2711) for GPIO 18.")
+print("  To get espeak audio from GPIO 18 speaker:")
+print("  1. Add a PAM8403 (or similar) amplifier between GPIO 18 and speaker.")
+print("  2. Route audio: dtoverlay=pwm-2chan will drive the amp input.")
+print("  OR plug speaker into the 3.5mm jack directly (no amp needed).")
+print("=" * 60)

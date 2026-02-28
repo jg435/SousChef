@@ -15,6 +15,10 @@ import board
 import busio
 import adafruit_mlx90640
 
+import sys
+sys.path.insert(0, "/home/pi/souschef")
+import led_states
+
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 app = Flask(__name__)
@@ -24,21 +28,30 @@ os.makedirs(SYNC_DIR, exist_ok=True)
 
 ai = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])
 
-# ---------- TTS (espeak-ng → bcm2835 PWM audio on GPIO 18) ----------
+# ---------- TTS (espeak-ng → sox +20dB → aplay hw:0,0) ----------
 _tts_proc = None
 _tts_lock = threading.Lock()
 
 def _speak(text):
-    """Speak text via espeak-ng, interrupting any ongoing speech."""
+    """Speak text, boosting gain +20dB via sox to drive 4Ω speaker from line-level out."""
     global _tts_proc
     with _tts_lock:
         if _tts_proc and _tts_proc.poll() is None:
             _tts_proc.terminate()
-        _tts_proc = subprocess.Popen(
-            ["espeak-ng", "-s", "140", "-a", "200", text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        espeak = subprocess.Popen(
+            ["espeak-ng", "--stdout", "-s", "140", text],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         )
+        sox = subprocess.Popen(
+            ["sox", "-t", "wav", "-", "-t", "wav", "-", "gain", "20"],
+            stdin=espeak.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        espeak.stdout.close()
+        _tts_proc = subprocess.Popen(
+            ["aplay", "-D", "hw:0,0", "-"],
+            stdin=sox.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        sox.stdout.close()
 
 
 # ---------- SSE broadcast (proactive alerts → all connected browsers) ----------
@@ -260,6 +273,7 @@ def proactive_loop():
                     "observation": observation,
                     "feedback": feedback,
                 })
+                led_states.set_led_state(state)
 
             print(f"[proactive] [{state or '?'}] {observation}")
             if feedback:
@@ -705,6 +719,7 @@ def voice_page():
 
 # ---------- Start ----------
 if __name__ == "__main__":
+    led_states.start()
     threading.Thread(target=capture_loop,   daemon=True).start()
     threading.Thread(target=proactive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8000, threaded=True)
