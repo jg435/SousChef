@@ -73,6 +73,10 @@ VALID_STATES = ("NO_STOVE", "IDLE", "PREHEATING", "READY", "COOKING", "DONE", "O
 
 PROACTIVE_SYSTEM = """\
 You are SousChef, a kitchen assistant watching through a camera above a stovetop.
+You also receive thermal sensor data. The key value is the HOTSPOT (max temp) and how
+far it is above the AMBIENT (min temp) — the delta tells you if a real heat source exists.
+
+Use the delta between hotspot and ambient alongside the camera image to judge heat intensity.
 
 Determine the current cooking state and share a brief observation.
 
@@ -293,8 +297,10 @@ def proactive_loop():
             continue
         img_b64 = base64.b64encode(jpg.tobytes()).decode("utf-8")
 
+        delta = t_max_v - t_min_v
         text_parts = [
-            f"Thermal sensor — min: {t_min_v:.1f}°C, max: {t_max_v:.1f}°C, avg: {t_avg_v:.1f}°C."
+            f"Thermal sensor — ambient: {t_min_v:.1f}°C, hotspot: {t_max_v:.1f}°C "
+            f"(+{delta:.1f}°C above ambient), scene avg: {t_avg_v:.1f}°C."
         ]
         sh = state_history_text(_state_log)
         if sh:
@@ -737,13 +743,14 @@ def ask():
     try:
         msg = ai.chat.completions.create(
             model="anthropic/claude-opus-4.6",
-            max_tokens=80,
+            max_tokens=30,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are SousChef, a cooking assistant with a kitchen camera and thermal sensor. "
-                        "Answer in 1 sentence — 2 max if essential. Be direct, like a chef calling out instructions."
+                        "You are SousChef, a real-time voice cooking assistant. "
+                        "Reply in 10 words or fewer. No numbers, no temperatures, no units. "
+                        "Use plain language: hot, warm, ready, too high, flip it, etc."
                     )
                 },
                 {
@@ -933,6 +940,9 @@ def voice_page():
 
 # ---------- Start ----------
 if __name__ == "__main__":
+    led_states.start()
+    led_states.set_led_state("NO_STOVE")
+
     if "--mock" in sys.argv:
         video = os.path.join(os.path.dirname(__file__), "..", "data", "test.mp4")
         for i, arg in enumerate(sys.argv):
