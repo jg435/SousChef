@@ -27,18 +27,35 @@ load_dotenv()
 MODEL = "google/gemini-2.5-flash"
 HISTORY_LIMIT = 6  # number of recent exchanges to include as context
 
-PROACTIVE_SYSTEM = (
-    "You are SousChef, a kitchen assistant watching through a camera above a stovetop. "
-    "If you see food being cooked or actively prepared, share one brief, "
-    "useful observation — a tip, a warning, or what you notice. "
-    "1-2 sentences max. Speak directly to the cook. "
-    "If nothing is cooking or the scene is empty/uninteresting, "
-    "still describe briefly what you see (1 sentence)."
-)
+VALID_STATES = ("NO_STOVE", "IDLE", "PREHEATING", "READY", "COOKING", "DONE", "OVERDONE")
+
+PROACTIVE_SYSTEM = """\
+You are SousChef, a kitchen assistant watching through a camera above a stovetop.
+
+Determine the current cooking state and share a brief observation.
+
+States (in order of typical progression):
+- NO_STOVE: Image does NOT show a stove or cooktop. Camera may be misaligned or obstructed.
+- IDLE: Stove visible but off. No active heat, no food.
+- PREHEATING: Burner on, pan/pot warming up, not hot enough to cook yet.
+- READY: Pan/pot is hot and ready for food (heat shimmer, oil spreading).
+- COOKING: Food is actively being cooked.
+- DONE: Food appears fully cooked and burner is off. Ready to plate.
+- OVERDONE: Food is overcooked — burning, charred, dried out, or smoking. Needs immediate attention.
+
+Format your response EXACTLY as:
+STATE: <one of the states above>
+<your 1-2 sentence observation>
+
+Example:
+STATE: COOKING
+The egg whites are starting to set around the edges — don't touch it yet.\
+"""
 
 REACTIVE_SYSTEM = (
     "You are SousChef, a warm and knowledgeable cooking assistant "
     "watching through a kitchen camera. You also have a thermal sensor. "
+    "The current cooking state and recent state history are provided for context. "
     "Give brief, practical, conversational answers — 1 to 3 sentences. "
     "Speak like a helpful chef standing next to the cook."
 )
@@ -80,17 +97,43 @@ def build_history_messages(history: list[dict]) -> list[dict]:
     return history[-HISTORY_LIMIT:]
 
 
+def parse_state_response(raw: str) -> tuple[str | None, str]:
+    """Parse a 'STATE: ...\nobservation' response into (state, observation)."""
+    lines = raw.strip().splitlines()
+    if lines and lines[0].startswith("STATE:"):
+        state = lines[0].split(":", 1)[1].strip().upper()
+        observation = "\n".join(lines[1:]).strip()
+        if state not in VALID_STATES:
+            state = None
+        return state, observation
+    return None, raw.strip()
+
+
+def state_history_text(state_log: list[dict]) -> str:
+    """Format recent state transitions with observations for LLM context."""
+    if not state_log:
+        return ""
+    lines = ["State history:"]
+    for entry in state_log[-5:]:
+        lines.append(f"- {entry['state']}: {entry['observation']}")
+    return "\n".join(lines)
+
+
 def call_proactive(client: OpenAI, img_b64: str, mime: str,
-                   thermal: dict | None, history: list[dict]) -> str:
-    """Proactive call: auto-analyze a scene on load or temp change."""
+                   thermal: dict | None, history: list[dict],
+                   state_log: list[dict]) -> tuple[str | None, str]:
+    """Proactive call: auto-analyze a scene. Returns (state, observation)."""
     user_content = [make_image_content(img_b64, mime)]
 
     text_parts = []
     t = thermal_text(thermal)
     if t:
         text_parts.append(t)
+    sh = state_history_text(state_log)
+    if sh:
+        text_parts.append(sh)
     text_parts.append("What do you observe?")
-    user_content.append({"type": "text", "text": " ".join(text_parts)})
+    user_content.append({"type": "text", "text": "\n".join(text_parts)})
 
     messages = build_history_messages(history) + [
         {"role": "user", "content": user_content},
@@ -100,12 +143,13 @@ def call_proactive(client: OpenAI, img_b64: str, mime: str,
         model=MODEL,
         messages=[{"role": "system", "content": PROACTIVE_SYSTEM}] + messages,
     )
-    return response.choices[0].message.content.strip()
+    return parse_state_response(response.choices[0].message.content)
 
 
 def call_reactive(client: OpenAI, question: str, img_b64: str | None,
                   mime: str | None, thermal: dict | None,
-                  history: list[dict]) -> str:
+                  history: list[dict], current_state: str | None,
+                  state_log: list[dict]) -> str:
     """Reactive call: answer a user question with current context."""
     user_content = []
 
@@ -116,6 +160,11 @@ def call_reactive(client: OpenAI, question: str, img_b64: str | None,
     t = thermal_text(thermal)
     if t:
         text_parts.append(t)
+    if current_state:
+        text_parts.append(f"Current state: {current_state}")
+    sh = state_history_text(state_log)
+    if sh:
+        text_parts.append(sh)
     text_parts.append(f"Question: {question}")
     user_content.append({"type": "text", "text": "\n".join(text_parts)})
 
@@ -158,6 +207,8 @@ def main():
     current_image_path: str | None = None
     thermal: dict | None = None  # {"min": float, "max": float, "avg": float}
     history: list[dict] = []  # conversation history
+    current_state: str | None = None
+    state_log: list[dict] = []  # [{"state": ..., "observation": ...}, ...]
 
     print("SousChef Simulator")
     print("Type 'help' for commands.\n")
@@ -200,11 +251,15 @@ def main():
 
             # Proactive analysis
             try:
-                observation = call_proactive(
-                    client, img_b64, mime, thermal, history,
+                state, observation = call_proactive(
+                    client, img_b64, mime, thermal, history, state_log,
                 )
-                print(observation)
-                # Add to history
+                if state:
+                    current_state = state
+                    state_log.append({"state": state, "observation": observation})
+                    print(f"[{state}] {observation}")
+                else:
+                    print(observation)
                 history.append({"role": "user", "content": f"[loaded image: {path}]"})
                 history.append({"role": "assistant", "content": observation})
             except Exception as e:
@@ -232,16 +287,20 @@ def main():
             if current_image:
                 img_b64, mime = current_image
                 try:
-                    observation = call_proactive(
-                        client, img_b64, mime, thermal, history,
+                    state, observation = call_proactive(
+                        client, img_b64, mime, thermal, history, state_log,
                     )
-                    if observation.lower() != "nothing":
+                    if state:
+                        current_state = state
+                        state_log.append({"state": state, "observation": observation})
+                        print(f"[{state}] {observation}")
+                    else:
                         print(observation)
-                        history.append({
-                            "role": "user",
-                            "content": f"[thermal update: min={t_min}, max={t_max}, avg={t_avg}]",
-                        })
-                        history.append({"role": "assistant", "content": observation})
+                    history.append({
+                        "role": "user",
+                        "content": f"[thermal update: min={t_min}, max={t_max}, avg={t_avg}]",
+                    })
+                    history.append({"role": "assistant", "content": observation})
                 except Exception as e:
                     print(f"LLM error: {e}")
             continue
@@ -253,6 +312,7 @@ def main():
         try:
             answer = call_reactive(
                 client, line, img_b64, mime, thermal, history,
+                current_state, state_log,
             )
             print(answer)
             history.append({"role": "user", "content": line})
