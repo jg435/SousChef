@@ -19,9 +19,9 @@ if "--mock" not in sys.argv:
     import busio
     import adafruit_mlx90640
 
-import sys
-sys.path.insert(0, "/home/pi/souschef")
-import led_states
+if "--mock" not in sys.argv:
+    sys.path.insert(0, "/home/pi/souschef")
+    import led_states
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
@@ -66,8 +66,9 @@ _t_max   = 0.0
 _t_avg   = 0.0
 
 # ---------- State tracking (structured proactive analysis) ----------
-_current_state = None
+_current_state = "NO_STOVE"
 _state_log     = []
+_current_dish  = None  # what the chef is making — proactive loop waits for this
 
 VALID_STATES = ("NO_STOVE", "IDLE", "PREHEATING", "READY", "COOKING", "DONE", "OVERDONE")
 
@@ -89,19 +90,28 @@ States (in order of typical progression):
 - DONE: Food appears fully cooked. Ready to plate.
 - OVERDONE: Food is overcooked — burning, charred, or smoking. Needs immediate attention.
 
-FEEDBACK rules — ONLY provide feedback when the cook is making a mistake:
-- Heat too high/low for what they're cooking (say "lower the heat" or "try medium heat", never cite degrees)
-- Food needs flipping/stirring and they haven't
-- Something is burning or about to burn
-- Pan is dry and food is sticking
-- Leave FEEDBACK blank when things are going fine. No praise, no encouragement, no "looking good".
+FEEDBACK rules — provide feedback ONLY in these two situations:
+
+1. CORRECTION: The cook is making a mistake in the current state.
+   - Heat too high or too low (say "lower the heat" or "try medium heat", never cite degrees)
+   - Food needs flipping or stirring and they haven't
+   - They arent making what they said they would (they said scrambled eggs but are making an omlette)
+   - Something is burning or about to burn
+   - Pan is dry and food is sticking
+
+2. POSITIVE REINFORCEMENT: The state just transitioned and the cook did the right thing.
+   - PREHEATING → COOKING: they added food at the right time ("nice, good timing")
+   - COOKING → DONE: food looks properly cooked ("perfect, that looks great")
+   Only praise on these transitions. Keep it brief — 3-5 words max.
+
+In all other cases, leave FEEDBACK blank. Do NOT repeat feedback you already gave (check the state history). Only repeat if the problem is getting worse.
 
 Never mention temperature numbers. Use terms like "too hot", "not hot enough", "medium heat", "low heat".
 
 Format EXACTLY as:
 STATE: <one of the states above>
 OBS: <1 short sentence>
-FEEDBACK: <correction or leave blank>\
+FEEDBACK: <correction, brief praise on transition, or leave blank>\
 """
 
 
@@ -314,7 +324,12 @@ def proactive_loop():
                 messages=[
                     {
                         "role": "system",
-                        "content": PROACTIVE_SYSTEM
+                        "content": PROACTIVE_SYSTEM + (
+                            f"\n\nThe chef is making: {_current_dish}."
+                            if _current_dish else
+                            "\n\nThe chef has not said what they are making yet. "
+                            "Only determine STATE and OBS. Leave FEEDBACK blank."
+                        )
                     },
                     {
                         "role": "user",
@@ -341,7 +356,8 @@ def proactive_loop():
                     "observation": observation,
                     "feedback": feedback,
                 })
-                led_states.set_led_state(state)
+                if "--mock" not in sys.argv:
+                    led_states.set_led_state(state)
 
             print(f"[proactive] [{state or '?'}] {observation}")
             if feedback:
@@ -487,10 +503,114 @@ def index():
             btn.disabled = true;
           }
 
+          let speaking = false;
+          const _audio = new Audio();
+          _audio.addEventListener('ended', () => { speaking = false; });
+          _audio.addEventListener('error', () => { speaking = false; });
+
+          async function speak(text) {
+            speaking = true;
+            try {
+              const res = await fetch('/tts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+              });
+              if (!res.ok) { speaking = false; return; }
+              const blob = await res.blob();
+              const url = URL.createObjectURL(blob);
+              _audio.src = url;
+              _audio.play();
+            } catch (e) {
+              console.error('TTS error:', e);
+              speaking = false;
+            }
+          }
+
+          // Returns a promise that resolves with the spoken text
+          function speakAndWait(text) {
+            return new Promise((resolve) => {
+              const onEnd = () => { _audio.removeEventListener('ended', onEnd); resolve(); };
+              _audio.addEventListener('ended', onEnd);
+              speak(text);
+            });
+          }
+
+          // --- Dish setup: ask what the chef is making (max 2 attempts) ---
+          let dishSet = false;
+
+          function listenForDish(attempt) {
+            if (!SR || attempt > 2) {
+              statusEl.textContent = 'Tap the mic to ask a question';
+              return;
+            }
+            const rec = new SR();
+            rec.lang = 'en-US';
+            rec.interimResults = false;
+            rec.maxAlternatives = 1;
+            btn.className = 'listening';
+            statusEl.textContent = 'Listening…';
+            rec.start();
+
+            rec.onresult = async (e) => {
+              const dish = e.results[0][0].transcript;
+              heardEl.textContent = 'Making: ' + dish;
+              btn.className = 'thinking';
+              statusEl.textContent = 'Got it!';
+              await fetch('/dish', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dish })
+              });
+              dishSet = true;
+              btn.className = '';
+              statusEl.textContent = 'Tap the mic to ask a question';
+            };
+            rec.onerror = () => {
+              btn.className = '';
+              if (attempt < 2) {
+                speakAndWait("Sorry, I didn't catch that. What are you making?").then(() => {
+                  listenForDish(attempt + 1);
+                });
+              } else {
+                statusEl.textContent = 'Tap the mic to ask a question';
+              }
+            };
+            rec.onend = () => {
+              if (!dishSet && btn.className === 'listening') {
+                btn.className = '';
+                if (attempt < 2) {
+                  speakAndWait("Sorry, I didn't catch that. What are you making?").then(() => {
+                    listenForDish(attempt + 1);
+                  });
+                } else {
+                  statusEl.textContent = 'Tap the mic to ask a question';
+                }
+              }
+            };
+          }
+
+          // First tap triggers dish prompt (user gesture unlocks audio)
+          if (SR) {
+            statusEl.textContent = 'Tap the mic to start';
+          }
+
           btn.addEventListener('click', () => {
             if (!SR || btn.disabled) return;
             heardEl.textContent  = '';
             answerEl.textContent = '';
+
+            // First tap: ask what they're making
+            if (!dishSet) {
+              btn.disabled = true;
+              speakAndWait("What are you making today?").then(() => {
+                btn.disabled = false;
+                listenForDish(1);
+              });
+              return;
+            }
+
+            // --- Normal voice Q&A ---
             const rec = new SR();
             rec.lang = 'en-US';
             rec.interimResults = false;
@@ -538,34 +658,12 @@ def index():
             }
           }
 
-          let speaking = false;
-          const _audio = new Audio();
-          _audio.addEventListener('ended', () => { speaking = false; });
-          _audio.addEventListener('error', () => { speaking = false; });
-
-          async function speak(text) {
-            speaking = true;
-            try {
-              const res = await fetch('/tts', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text })
-              });
-              if (!res.ok) { speaking = false; return; }
-              const blob = await res.blob();
-              const url = URL.createObjectURL(blob);
-              _audio.src = url;
-              _audio.play();
-            } catch (e) {
-              console.error('TTS error:', e);
-              speaking = false;
-            }
-          }
-
           // SSE for proactive observations
           const _es = new EventSource('/events');
           const _fb = document.getElementById('feedback');
           let _fbT;
+          let _lastState = 'NO_STOVE';
+          let _stoveGreeted = false;
           _es.onmessage = (e) => {
             const d = JSON.parse(e.data);
             document.getElementById('fb-state').textContent = d.state || '';
@@ -576,6 +674,18 @@ def index():
             _fb.classList.add('show');
             clearTimeout(_fbT);
             _fbT = setTimeout(() => _fb.classList.remove('show'), 14000);
+
+            // One-time greeting when stove first appears
+            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state && d.state !== 'NO_STOVE') {
+              _stoveGreeted = true;
+              document.getElementById('fb-obs').textContent =
+                "I see you at the stove! Tap the mic to tell me what you're making.";
+              tip.textContent = '';
+              tip.style.display = 'none';
+              statusEl.textContent = "Tap the mic to tell me what you're making";
+            }
+            if (d.state) _lastState = d.state;
+
             // Only speak if there's actionable feedback
             if (d.feedback && btn.className === '' && !speaking) {
               speak(d.feedback);
@@ -704,6 +814,18 @@ def events():
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@app.route("/dish", methods=["POST"])
+def set_dish():
+    """Set what the chef is making."""
+    global _current_dish
+    dish = (request.get_json() or {}).get("dish", "").strip()
+    if not dish:
+        return "No dish provided", 400
+    _current_dish = dish
+    print(f"[dish] Chef is making: {dish}")
+    return jsonify({"dish": dish})
+
+
 @app.route("/tts", methods=["POST"])
 def tts():
     """Generate MP3 audio from text using edge-tts."""
@@ -724,6 +846,9 @@ def ask():
     question = (request.get_json() or {}).get("question", "").strip()
     if not question:
         return jsonify({"answer": "I didn't catch that — could you try again?"})
+
+    if _current_dish is None:
+        return jsonify({"answer": "First, tell me what you're making today.", "need_dish": True})
 
     with _lock:
         frame   = _rgb.copy() if _rgb is not None else None
@@ -750,7 +875,8 @@ def ask():
                     "content": (
                         "You are SousChef, a real-time voice cooking assistant. "
                         "Reply in 10 words or fewer. No numbers, no temperatures, no units. "
-                        "Use plain language: hot, warm, ready, too high, flip it, etc."
+                        "Use plain language: hot, warm, ready, too high, flip it, etc. "
+                        f"The chef is making: {_current_dish}."
                     )
                 },
                 {
@@ -864,11 +990,88 @@ def voice_page():
             }
           }
 
+          function speakAndWait(text) {
+            return new Promise((resolve) => {
+              const onEnd = () => { _audio.removeEventListener('ended', onEnd); resolve(); };
+              _audio.addEventListener('ended', onEnd);
+              speak(text);
+            });
+          }
+
+          // --- Dish setup: ask what the chef is making (max 2 attempts) ---
+          let dishSet = false;
+
+          function listenForDish(attempt) {
+            if (!SR || attempt > 2) {
+              statusEl.textContent = 'Tap the mic to ask a question';
+              return;
+            }
+            const rec = new SR();
+            rec.lang = 'en-US';
+            rec.interimResults = false;
+            rec.maxAlternatives = 1;
+            btn.className = 'listening';
+            statusEl.textContent = 'Listening…';
+            rec.start();
+
+            rec.onresult = async (e) => {
+              const dish = e.results[0][0].transcript;
+              heardEl.textContent = 'Making: ' + dish;
+              btn.className = 'thinking';
+              statusEl.textContent = 'Got it!';
+              await fetch('/dish', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ dish })
+              });
+              dishSet = true;
+              btn.className = '';
+              statusEl.textContent = 'Tap the mic to ask a question';
+            };
+            rec.onerror = () => {
+              btn.className = '';
+              if (attempt < 2) {
+                speakAndWait("Sorry, I didn't catch that. What are you making?").then(() => {
+                  listenForDish(attempt + 1);
+                });
+              } else {
+                statusEl.textContent = 'Tap the mic to ask a question';
+              }
+            };
+            rec.onend = () => {
+              if (!dishSet && btn.className === 'listening') {
+                btn.className = '';
+                if (attempt < 2) {
+                  speakAndWait("Sorry, I didn't catch that. What are you making?").then(() => {
+                    listenForDish(attempt + 1);
+                  });
+                } else {
+                  statusEl.textContent = 'Tap the mic to ask a question';
+                }
+              }
+            };
+          }
+
+          if (SR) {
+            statusEl.textContent = 'Tap the mic to start';
+          }
+
           btn.addEventListener('click', () => {
             if (!SR || btn.disabled) return;
             heardEl.textContent  = '';
             answerEl.textContent = '';
 
+            // First tap: ask what they're making
+            if (!dishSet) {
+              btn.disabled = true;
+              speakAndWait("What are you making today?").then(() => {
+                btn.disabled = false;
+                listenForDish(1);
+              });
+              return;
+            }
+
+            // --- Normal voice Q&A ---
             const rec = new SR();
             rec.lang = 'en-US';
             rec.interimResults = false;
@@ -919,9 +1122,23 @@ def voice_page():
           }
 
           // Proactive observations via SSE
+          let _lastState = 'NO_STOVE';
+          let _stoveGreeted = false;
           const es = new EventSource('/events');
           es.onmessage = (e) => {
             const d = JSON.parse(e.data);
+
+            // One-time greeting when stove first appears
+            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state && d.state !== 'NO_STOVE') {
+              _stoveGreeted = true;
+              answerEl.textContent = "I see you at the stove! Tap the mic to tell me what you're making.";
+              heardEl.textContent = '';
+              statusEl.textContent = "Tap the mic to tell me what you're making";
+              if (d.state) _lastState = d.state;
+              return;
+            }
+            if (d.state) _lastState = d.state;
+
             // Don't interrupt if user is mid-question or already speaking
             if (btn.className !== '' || speaking) return;
             let text = d.observation || '';
@@ -940,8 +1157,9 @@ def voice_page():
 
 # ---------- Start ----------
 if __name__ == "__main__":
-    led_states.start()
-    led_states.set_led_state("NO_STOVE")
+    if "--mock" not in sys.argv:
+        led_states.start()
+        led_states.set_led_state("NO_STOVE")
 
     if "--mock" in sys.argv:
         video = os.path.join(os.path.dirname(__file__), "..", "data", "test.mp4")
