@@ -699,10 +699,10 @@ def index():
             clearTimeout(_fbT);
             _fbT = setTimeout(() => _fb.classList.remove('show'), 14000);
 
-            // One-time greeting when stove starts preheating
-            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state === 'PREHEATING') {
+            // One-time greeting when stove transitions from NO_STOVE to any active state
+            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state && d.state !== 'NO_STOVE') {
               _stoveGreeted = true;
-              const q = "Looks like you're heating up! What are you cooking today?";
+              const q = "What are you cooking today?";
               _greetingText = q;  // save for replay on first user gesture if autoplay is blocked
               document.getElementById('fb-obs').textContent = q;
               tip.textContent = '';
@@ -1171,10 +1171,10 @@ def voice_page():
           es.onmessage = (e) => {
             const d = JSON.parse(e.data);
 
-            // One-time greeting when stove starts preheating
-            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state === 'PREHEATING') {
+            // One-time greeting when stove transitions from NO_STOVE to any active state
+            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state && d.state !== 'NO_STOVE') {
               _stoveGreeted = true;
-              const q = "Looks like you're heating up! What are you cooking today?";
+              const q = "What are you cooking today?";
               answerEl.textContent = q;
               heardEl.textContent = '';
               statusEl.textContent = "Tap the mic to answer";
