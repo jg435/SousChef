@@ -20,7 +20,27 @@ OPENROUTER_API_KEY=your_key_here
 
 Get an API key at [openrouter.ai](https://openrouter.ai/).
 
-## Simulator
+## Running
+
+### Raspberry Pi
+
+Run the server on a Raspberry Pi connected to the thermal camera:
+
+```bash
+python thermal/server.py
+```
+
+### Demo mode
+
+To run without hardware (uses mock data):
+
+```bash
+python thermal/server.py --mock
+```
+
+This plays back a video file called `test.mp4` in place of the live camera feed. A default `test.mp4` is included in the repo.
+
+## Old Testing Framework
 
 `simulate.py` is an interactive terminal assistant that lets you test SousChef using photos from disk instead of a live camera.
 
