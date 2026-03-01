@@ -38,7 +38,11 @@ To run without hardware (uses mock data):
 python thermal/server.py --mock
 ```
 
-This plays back a video file called `test.mp4` in place of the live camera feed. A default `test.mp4` is included in the repo.
+This plays back a video file called `test.mp4` in place of the live camera feed. A default `test.mp4` is included in the repo. The video file must be named `test.mp4` for the mock mode to work.
+
+Once the system detects a user trying to cook on the stove, it will automatically prompt them to say what dish they are making via the microphone button. This is required before SousChef will begin giving cooking feedback. After the dish is set, the microphone can be used for follow-up voice questions at any time.
+
+**Note:** The thermal camera images shown in demo mode are AI-generated to simulate a thermal camera view. They are not real thermal readings and should not be treated as accurate.
 
 ## Old Testing Framework
 
