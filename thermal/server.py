@@ -183,6 +183,7 @@ def capture_loop():
                 denom = (t_max - t_min) if (t_max - t_min) > 1e-6 else 1.0
                 norm  = ((arr - t_min) / denom * 255.0).astype(np.uint8)
                 vis   = cv2.resize(norm, (480, 360), interpolation=cv2.INTER_NEAREST)
+                vis   = cv2.rotate(vis, cv2.ROTATE_180)
                 thermal_color = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
                 cv2.putText(thermal_color, f"min {t_min:.1f}C", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -262,6 +263,7 @@ def mock_capture_loop(video_path):
         denom = (t_max - t_min) if (t_max - t_min) > 1e-6 else 1.0
         norm = ((thermal_arr - t_min) / denom * 255.0).astype(np.uint8)
         vis = cv2.resize(norm, (480, 360), interpolation=cv2.INTER_NEAREST)
+        vis = cv2.rotate(vis, cv2.ROTATE_180)
         thermal_color = cv2.applyColorMap(vis, cv2.COLORMAP_INFERNO)
         cv2.putText(thermal_color, f"min {t_min:.1f}C", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
@@ -504,6 +506,8 @@ def index():
           }
 
           let speaking = false;
+          let _greetingPlayed = false;  // tracks if SSE greeting actually played (not blocked)
+          let _greetingText = null;     // stores greeting text for retry on first user gesture
           const _audio = new Audio();
           _audio.addEventListener('ended', () => { speaking = false; });
           _audio.addEventListener('error', () => { speaking = false; });
@@ -516,23 +520,34 @@ def index():
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text })
               });
-              if (!res.ok) { speaking = false; return; }
+              if (!res.ok) { speaking = false; return false; }
               const blob = await res.blob();
               const url = URL.createObjectURL(blob);
               _audio.src = url;
-              _audio.play();
+              try { await _audio.play(); return true; } catch (e) {
+                console.warn('Autoplay blocked:', e);
+                speaking = false;
+                return false;
+              }
             } catch (e) {
               console.error('TTS error:', e);
               speaking = false;
+              return false;
             }
           }
 
-          // Returns a promise that resolves with the spoken text
+          // Returns a promise that resolves when audio ends (or immediately if blocked/fails)
           function speakAndWait(text) {
             return new Promise((resolve) => {
-              const onEnd = () => { _audio.removeEventListener('ended', onEnd); resolve(); };
-              _audio.addEventListener('ended', onEnd);
-              speak(text);
+              const cleanup = () => {
+                _audio.removeEventListener('ended', cleanup);
+                _audio.removeEventListener('error', cleanup);
+                resolve();
+              };
+              _audio.addEventListener('ended', cleanup);
+              _audio.addEventListener('error', cleanup);
+              speak(text).then(() => { if (!speaking) resolve(); });
+              setTimeout(resolve, 10000); // fallback if audio stalls
             });
           }
 
@@ -602,11 +617,17 @@ def index():
 
             // First tap: ask what they're making
             if (!dishSet) {
-              btn.disabled = true;
-              speakAndWait("What are you making today?").then(() => {
-                btn.disabled = false;
+              if (_stoveGreeted && _greetingPlayed) {
+                // SSE greeting already played successfully — go straight to listening
                 listenForDish(1);
-              });
+              } else {
+                // Either SSE hasn't fired yet, or greeting was autoplay-blocked — speak now within user gesture
+                btn.disabled = true;
+                speakAndWait(_greetingText || "What are you making today?").then(() => {
+                  btn.disabled = false;
+                  listenForDish(1);
+                });
+              }
               return;
             }
 
@@ -616,6 +637,9 @@ def index():
             rec.interimResults = false;
             rec.maxAlternatives = 1;
 
+            _audio.pause();
+            _audio.currentTime = 0;
+            speaking = false;
             btn.className = 'listening';
             statusEl.textContent = 'Listening…';
             rec.start();
@@ -675,14 +699,16 @@ def index():
             clearTimeout(_fbT);
             _fbT = setTimeout(() => _fb.classList.remove('show'), 14000);
 
-            // One-time greeting when stove first appears
-            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state && d.state !== 'NO_STOVE') {
+            // One-time greeting when stove starts preheating
+            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state === 'PREHEATING') {
               _stoveGreeted = true;
-              document.getElementById('fb-obs').textContent =
-                "I see you at the stove! Tap the mic to tell me what you're making.";
+              const q = "Looks like you're heating up! What are you cooking today?";
+              _greetingText = q;  // save for replay on first user gesture if autoplay is blocked
+              document.getElementById('fb-obs').textContent = q;
               tip.textContent = '';
               tip.style.display = 'none';
-              statusEl.textContent = "Tap the mic to tell me what you're making";
+              statusEl.textContent = "Tap the mic to answer";
+              speak(q).then(played => { _greetingPlayed = played; });
             }
             if (d.state) _lastState = d.state;
 
@@ -983,7 +1009,10 @@ def voice_page():
               const blob = await res.blob();
               const url = URL.createObjectURL(blob);
               _audio.src = url;
-              _audio.play();
+              try { await _audio.play(); } catch (e) {
+                console.warn('Autoplay blocked:', e);
+                speaking = false;
+              }
             } catch (e) {
               console.error('TTS error:', e);
               speaking = false;
@@ -992,9 +1021,15 @@ def voice_page():
 
           function speakAndWait(text) {
             return new Promise((resolve) => {
-              const onEnd = () => { _audio.removeEventListener('ended', onEnd); resolve(); };
-              _audio.addEventListener('ended', onEnd);
-              speak(text);
+              const cleanup = () => {
+                _audio.removeEventListener('ended', cleanup);
+                _audio.removeEventListener('error', cleanup);
+                resolve();
+              };
+              _audio.addEventListener('ended', cleanup);
+              _audio.addEventListener('error', cleanup);
+              speak(text).then(() => { if (!speaking) resolve(); });
+              setTimeout(resolve, 10000); // fallback if audio stalls
             });
           }
 
@@ -1063,11 +1098,16 @@ def voice_page():
 
             // First tap: ask what they're making
             if (!dishSet) {
-              btn.disabled = true;
-              speakAndWait("What are you making today?").then(() => {
-                btn.disabled = false;
+              if (_stoveGreeted) {
+                // SSE already asked — go straight to listening (must be synchronous for SR user-gesture)
                 listenForDish(1);
-              });
+              } else {
+                btn.disabled = true;
+                speakAndWait("What are you making today?").then(() => {
+                  btn.disabled = false;
+                  listenForDish(1);
+                });
+              }
               return;
             }
 
@@ -1077,6 +1117,9 @@ def voice_page():
             rec.interimResults = false;
             rec.maxAlternatives = 1;
 
+            _audio.pause();
+            _audio.currentTime = 0;
+            speaking = false;
             btn.className = 'listening';
             statusEl.textContent = 'Listening…';
             rec.start();
@@ -1128,12 +1171,14 @@ def voice_page():
           es.onmessage = (e) => {
             const d = JSON.parse(e.data);
 
-            // One-time greeting when stove first appears
-            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state && d.state !== 'NO_STOVE') {
+            // One-time greeting when stove starts preheating
+            if (!_stoveGreeted && !dishSet && _lastState === 'NO_STOVE' && d.state === 'PREHEATING') {
               _stoveGreeted = true;
-              answerEl.textContent = "I see you at the stove! Tap the mic to tell me what you're making.";
+              const q = "Looks like you're heating up! What are you cooking today?";
+              answerEl.textContent = q;
               heardEl.textContent = '';
-              statusEl.textContent = "Tap the mic to tell me what you're making";
+              statusEl.textContent = "Tap the mic to answer";
+              speak(q);
               if (d.state) _lastState = d.state;
               return;
             }
